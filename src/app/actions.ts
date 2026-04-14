@@ -61,61 +61,19 @@ async function getPlaceDetails(place_id: string, niche: string, city: string, ne
   }
 }
 
-// Busca uma página usando next_page_token com tentativas automáticas (retry)
-// IMPORTANTE: O Google exige que ao usar pagetoken, APENAS pagetoken e key sejam enviados.
-// A biblioteca @googlemaps/google-maps-services-js adiciona parâmetros extras que causam erro 400.
-// Por isso, usamos fetch direto para as páginas 2 e 3.
-async function fetchPageDirect(
-  pagetoken: string,
-  apiKey: string,
-  pageNumber: number,
-  maxRetries = 4,
-  initialDelayMs = 2500
-): Promise<{ results: any[]; nextPageToken?: string } | null> {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    // Delay acumulativo
-    const waitMs = initialDelayMs * attempt;
-    console.log(`[Maps Scraper] Página ${pageNumber} - tentativa ${attempt}/${maxRetries}: aguardando ${waitMs}ms...`);
-    await new Promise(resolve => setTimeout(resolve, waitMs));
-
-    try {
-      // Requisição direta com SOMENTE pagetoken e key (sem biblioteca)
-      const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?pagetoken=${encodeURIComponent(pagetoken)}&key=${apiKey}`;
-      const response = await fetch(url);
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-
-      const data = await response.json();
-      const status: string = data.status;
-      console.log(`[Maps Scraper] Página ${pageNumber} - tentativa ${attempt}: status=${status}, resultados=${data.results?.length ?? 0}`);
-
-      // INVALID_REQUEST = token ainda não propagado, tenta novamente
-      if (status === 'INVALID_REQUEST' && attempt < maxRetries) {
-        continue;
-      }
-
-      if (status === 'OK' || status === 'ZERO_RESULTS') {
-        return {
-          results: data.results || [],
-          nextPageToken: data.next_page_token,
-        };
-      }
-
-      // Última tentativa, retorna o que tiver
-      if (attempt === maxRetries) {
-        console.warn(`[Maps Scraper] Página ${pageNumber}: status final = ${status}`);
-        return { results: data.results || [] };
-      }
-    } catch (err: any) {
-      console.error(`[Maps Scraper] Erro na tentativa ${attempt}/${maxRetries}:`, err?.message);
-      if (attempt === maxRetries) return null;
-    }
+// Executa uma única busca de texto e retorna os resultados brutos
+async function runTextSearch(query: string, apiKey: string): Promise<any[]> {
+  try {
+    console.log(`[Maps Scraper] Buscando: "${query}"`);
+    const response = await mapsClient.textSearch({ params: { query, key: apiKey } });
+    const results = response.data.results || [];
+    console.log(`[Maps Scraper] "${query}": ${results.length} resultados`);
+    return results;
+  } catch (err: any) {
+    console.error(`[Maps Scraper] Falha na query "${query}":`, err?.message);
+    return [];
   }
-  return null;
 }
-
 
 export async function searchCompanies(data: z.infer<typeof searchSchema>): Promise<Company[]> {
   const apiKey = process.env.GOOGLE_MAPS_API_KEY;
@@ -123,60 +81,50 @@ export async function searchCompanies(data: z.infer<typeof searchSchema>): Promi
     throw new Error('Configuração incompleta: API Key ausente.');
   }
 
-  // Monta a query limpando espaços extras (ex: quando bairro não é informado)
-  const queryParts = [data.industry, data.neighborhood, data.city].filter(Boolean);
-  const query = queryParts.join(' ');
+  // Monta 3 variações da query para maximizar resultados únicos (até 60)
+  // A paginação via next_page_token do Google é instável em Cloud Run, então
+  // usamos múltiplas buscas paralelas com deduplicação por place_id.
+  const { industry, city, neighborhood } = data;
 
-  let allResults: any[] = [];
-  
+  const query1 = [industry, neighborhood, city].filter(Boolean).join(' ');
+  const query2 = [industry, city].filter(Boolean).join(' ');
+  const query3 = neighborhood
+    ? `${industry} em ${neighborhood} ${city}`
+    : `melhores ${industry} ${city}`;
+
+  console.log(`[Maps Scraper] Iniciando 3 buscas paralelas para: ${industry} / ${city}`);
+
+  // Executa as 3 buscas em paralelo
+  const [results1, results2, results3] = await Promise.all([
+    runTextSearch(query1, apiKey),
+    runTextSearch(query2, apiKey),
+    runTextSearch(query3, apiKey),
+  ]);
+
+  // Deduplica todos os resultados por place_id
+  const seen = new Set<string>();
+  const uniqueResults: any[] = [];
+  for (const r of [...results1, ...results2, ...results3]) {
+    if (r.place_id && !seen.has(r.place_id)) {
+      seen.add(r.place_id);
+      uniqueResults.push(r);
+    }
+  }
+
+  console.log(`[Maps Scraper] Total único após deduplicação: ${uniqueResults.length} (de ${results1.length + results2.length + results3.length} brutos)`);
+
+  if (uniqueResults.length === 0) return [];
+
   try {
-    console.log(`[Maps Scraper] Iniciando busca: "${query}"`);
-    const response = await mapsClient.textSearch({
-      params: { query, key: apiKey },
-    });
-    
-    if (response.data.results) {
-      allResults = [...response.data.results];
-    }
-
-    console.log(`[Maps Scraper] Página 1: ${allResults.length} resultados. Token: ${response.data.next_page_token ? 'sim' : 'não'}`);
-
-    let nextPageToken = response.data.next_page_token;
-    // pageNumber representa a PRÓXIMA página a ser buscada (2 e 3)
-    let pageNumber = 2;
-
-    // Busca as pages 2 e 3 (Google limita a 60 resultados = 3 páginas de 20)
-    while (nextPageToken && pageNumber <= 3) {
-      const pageData = await fetchPageDirect(nextPageToken, apiKey, pageNumber);
-
-      if (!pageData) {
-        console.warn(`[Maps Scraper] Página ${pageNumber} falhou após todas as tentativas.`);
-        break;
-      }
-      
-      allResults = [...allResults, ...pageData.results];
-      nextPageToken = pageData.nextPageToken;
-      console.log(`[Maps Scraper] Página ${pageNumber} coletada: +${pageData.results.length} resultados. Total acumulado: ${allResults.length}`);
-      pageNumber++;
-    }
-
-    if (pageNumber === 2) {
-      console.warn('[Maps Scraper] ATENÇÃO: next_page_token não foi retornado pelo Google na página 1. Apenas 20 resultados disponíveis.');
-    }
-
-    console.log(`[Maps Scraper] Busca finalizada. Total de lugares encontrados: ${allResults.length}`);
-
-    if (allResults.length === 0) return [];
-
     const companies: Company[] = [];
-    const batchSize = 15; // Processar em lotes menores para evitar timeout
-    
-    for (let i = 0; i < allResults.length; i += batchSize) {
-      const batch = allResults.slice(i, i + batchSize);
+    const batchSize = 15; // Processar em lotes para evitar timeout
+
+    for (let i = 0; i < uniqueResults.length; i += batchSize) {
+      const batch = uniqueResults.slice(i, i + batchSize);
       const detailPromises = batch
         .filter(p => p.place_id)
         .map(p => getPlaceDetails(p.place_id!, data.industry, data.city, data.neighborhood));
-      
+
       const batchResults = await Promise.all(detailPromises);
       companies.push(...batchResults.filter((c): c is Company => c !== null));
     }
@@ -188,6 +136,7 @@ export async function searchCompanies(data: z.infer<typeof searchSchema>): Promi
     throw new Error('Falha ao processar busca no Google Maps.');
   }
 }
+
 
 export async function handleEnrichData({ companyName }: { companyName: string }): Promise<string> {
   const { enrichCompanyData } = await import('@/ai/flows/data-enrichment');
