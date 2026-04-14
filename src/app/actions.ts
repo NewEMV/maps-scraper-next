@@ -62,38 +62,51 @@ async function getPlaceDetails(place_id: string, niche: string, city: string, ne
 }
 
 // Busca uma página usando next_page_token com tentativas automáticas (retry)
-// O Google exige que o token seja propagado antes de usá-lo, o que pode levar alguns segundos
-async function fetchPageWithRetry(
+// IMPORTANTE: O Google exige que ao usar pagetoken, APENAS pagetoken e key sejam enviados.
+// A biblioteca @googlemaps/google-maps-services-js adiciona parâmetros extras que causam erro 400.
+// Por isso, usamos fetch direto para as páginas 2 e 3.
+async function fetchPageDirect(
   pagetoken: string,
   apiKey: string,
   pageNumber: number,
   maxRetries = 4,
-  delayMs = 3000
+  initialDelayMs = 2500
 ): Promise<{ results: any[]; nextPageToken?: string } | null> {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    // Delay acumulativo: quanto mais tentativas, mais tempo espera
-    const waitMs = delayMs * attempt;
+    // Delay acumulativo
+    const waitMs = initialDelayMs * attempt;
     console.log(`[Maps Scraper] Página ${pageNumber} - tentativa ${attempt}/${maxRetries}: aguardando ${waitMs}ms...`);
     await new Promise(resolve => setTimeout(resolve, waitMs));
+
     try {
-      const response = await mapsClient.textSearch({
-        params: { pagetoken, key: apiKey },
-      });
-      const status = response.data.status;
-      console.log(`[Maps Scraper] Página ${pageNumber} - tentativa ${attempt}: status=${status}, resultados=${response.data.results?.length ?? 0}`);
-      // INVALID_REQUEST significa que o token ainda não está pronto
+      // Requisição direta com SOMENTE pagetoken e key (sem biblioteca)
+      const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?pagetoken=${encodeURIComponent(pagetoken)}&key=${apiKey}`;
+      const response = await fetch(url);
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const data = await response.json();
+      const status: string = data.status;
+      console.log(`[Maps Scraper] Página ${pageNumber} - tentativa ${attempt}: status=${status}, resultados=${data.results?.length ?? 0}`);
+
+      // INVALID_REQUEST = token ainda não propagado, tenta novamente
       if (status === 'INVALID_REQUEST' && attempt < maxRetries) {
         continue;
       }
+
       if (status === 'OK' || status === 'ZERO_RESULTS') {
         return {
-          results: response.data.results || [],
-          nextPageToken: response.data.next_page_token,
+          results: data.results || [],
+          nextPageToken: data.next_page_token,
         };
       }
-      // Qualquer outro status na última tentativa, retorna o que tiver
+
+      // Última tentativa, retorna o que tiver
       if (attempt === maxRetries) {
-        return { results: response.data.results || [] };
+        console.warn(`[Maps Scraper] Página ${pageNumber}: status final = ${status}`);
+        return { results: data.results || [] };
       }
     } catch (err: any) {
       console.error(`[Maps Scraper] Erro na tentativa ${attempt}/${maxRetries}:`, err?.message);
@@ -102,6 +115,7 @@ async function fetchPageWithRetry(
   }
   return null;
 }
+
 
 export async function searchCompanies(data: z.infer<typeof searchSchema>): Promise<Company[]> {
   const apiKey = process.env.GOOGLE_MAPS_API_KEY;
@@ -133,7 +147,7 @@ export async function searchCompanies(data: z.infer<typeof searchSchema>): Promi
 
     // Busca as pages 2 e 3 (Google limita a 60 resultados = 3 páginas de 20)
     while (nextPageToken && pageNumber <= 3) {
-      const pageData = await fetchPageWithRetry(nextPageToken, apiKey, pageNumber);
+      const pageData = await fetchPageDirect(nextPageToken, apiKey, pageNumber);
 
       if (!pageData) {
         console.warn(`[Maps Scraper] Página ${pageNumber} falhou após todas as tentativas.`);
