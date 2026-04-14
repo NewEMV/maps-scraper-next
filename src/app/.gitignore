@@ -1,0 +1,48 @@
+# dependências
+node_modules/
+/.pnp
+.pnp.js
+
+# testes
+/coverage
+
+# next.js
+/.next/
+/out/
+/build
+
+# produção
+/build
+
+# outros
+.DS_Store
+*.pem
+.idx/
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# arquivos de ambiente locais
+.env*.local
+.env
+.env.local
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# firebase (IMPORTANTE: ignora os 10 mil arquivos temporários)
+.firebase/
+.firebaserc
+firebase-debug.log*
+firestore-debug.log*
+pubsub-debug.log*
+ui-debug.log*
+
+# builds do firebase hosting
+dist/
