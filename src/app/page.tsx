@@ -30,7 +30,7 @@ import { CompanyCard } from '@/components/company-card';
 import { ResultsSkeleton } from '@/components/results-skeleton';
 
 // Configuração de timeout para a página e suas ações
-export const maxDuration = 60;
+export const maxDuration = 120;
 
 const searchFormSchema = z.object({
   industry: z.string().min(2, { message: 'Nicho deve ter pelo menos 2 caracteres.' }),

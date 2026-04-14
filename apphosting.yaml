@@ -2,3 +2,4 @@ runConfig:
   maxInstances: 1
   cpu: 1
   memoryMiB: 1024
+  timeoutSeconds: 120

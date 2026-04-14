@@ -66,25 +66,35 @@ async function getPlaceDetails(place_id: string, niche: string, city: string, ne
 async function fetchPageWithRetry(
   pagetoken: string,
   apiKey: string,
-  maxRetries = 3,
-  delayMs = 2500
+  pageNumber: number,
+  maxRetries = 4,
+  delayMs = 3000
 ): Promise<{ results: any[]; nextPageToken?: string } | null> {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    await new Promise(resolve => setTimeout(resolve, delayMs));
+    // Delay acumulativo: quanto mais tentativas, mais tempo espera
+    const waitMs = delayMs * attempt;
+    console.log(`[Maps Scraper] Página ${pageNumber} - tentativa ${attempt}/${maxRetries}: aguardando ${waitMs}ms...`);
+    await new Promise(resolve => setTimeout(resolve, waitMs));
     try {
       const response = await mapsClient.textSearch({
         params: { pagetoken, key: apiKey },
       });
       const status = response.data.status;
-      // Se o token ainda não está pronto, o Google retorna INVALID_REQUEST
+      console.log(`[Maps Scraper] Página ${pageNumber} - tentativa ${attempt}: status=${status}, resultados=${response.data.results?.length ?? 0}`);
+      // INVALID_REQUEST significa que o token ainda não está pronto
       if (status === 'INVALID_REQUEST' && attempt < maxRetries) {
-        console.log(`[Maps Scraper] Tentativa ${attempt}/${maxRetries}: token ainda não propagado. Aguardando...`);
         continue;
       }
-      return {
-        results: response.data.results || [],
-        nextPageToken: response.data.next_page_token,
-      };
+      if (status === 'OK' || status === 'ZERO_RESULTS') {
+        return {
+          results: response.data.results || [],
+          nextPageToken: response.data.next_page_token,
+        };
+      }
+      // Qualquer outro status na última tentativa, retorna o que tiver
+      if (attempt === maxRetries) {
+        return { results: response.data.results || [] };
+      }
     } catch (err: any) {
       console.error(`[Maps Scraper] Erro na tentativa ${attempt}/${maxRetries}:`, err?.message);
       if (attempt === maxRetries) return null;
@@ -118,22 +128,26 @@ export async function searchCompanies(data: z.infer<typeof searchSchema>): Promi
     console.log(`[Maps Scraper] Página 1: ${allResults.length} resultados. Token: ${response.data.next_page_token ? 'sim' : 'não'}`);
 
     let nextPageToken = response.data.next_page_token;
-    let pageCount = 1;
+    // pageNumber representa a PRÓXIMA página a ser buscada (2 e 3)
+    let pageNumber = 2;
 
-    // Busca até 3 páginas (máximo de 60 resultados do Google)
-    while (nextPageToken && pageCount < 3) {
-      console.log(`[Maps Scraper] Buscando página ${pageCount + 1}/3...`);
-      const pageData = await fetchPageWithRetry(nextPageToken, apiKey);
+    // Busca as pages 2 e 3 (Google limita a 60 resultados = 3 páginas de 20)
+    while (nextPageToken && pageNumber <= 3) {
+      const pageData = await fetchPageWithRetry(nextPageToken, apiKey, pageNumber);
 
       if (!pageData) {
-        console.warn(`[Maps Scraper] Página ${pageCount + 1} falhou após todas as tentativas. Retornando o que foi coletado.`);
+        console.warn(`[Maps Scraper] Página ${pageNumber} falhou após todas as tentativas.`);
         break;
       }
       
       allResults = [...allResults, ...pageData.results];
       nextPageToken = pageData.nextPageToken;
-      pageCount++;
-      console.log(`[Maps Scraper] Página ${pageCount}: +${pageData.results.length} resultados. Total: ${allResults.length}`);
+      console.log(`[Maps Scraper] Página ${pageNumber} coletada: +${pageData.results.length} resultados. Total acumulado: ${allResults.length}`);
+      pageNumber++;
+    }
+
+    if (pageNumber === 2) {
+      console.warn('[Maps Scraper] ATENÇÃO: next_page_token não foi retornado pelo Google na página 1. Apenas 20 resultados disponíveis.');
     }
 
     console.log(`[Maps Scraper] Busca finalizada. Total de lugares encontrados: ${allResults.length}`);
