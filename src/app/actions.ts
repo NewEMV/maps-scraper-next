@@ -81,18 +81,28 @@ export async function searchCompanies(data: z.infer<typeof searchSchema>): Promi
     throw new Error('Configuração incompleta: API Key ausente.');
   }
 
-  // Monta 3 variações da query para maximizar resultados únicos (até 60)
-  // A paginação via next_page_token do Google é instável em Cloud Run, então
-  // usamos múltiplas buscas paralelas com deduplicação por place_id.
+  // Monta 3 variações da query, SEMPRE mantendo o foco geográfico informado.
+  // Quando bairro é informado, TODAS as queries incluem o bairro para não vazar para outras regiões.
   const { industry, city, neighborhood } = data;
 
-  const query1 = [industry, neighborhood, city].filter(Boolean).join(' ');
-  const query2 = [industry, city].filter(Boolean).join(' ');
-  const query3 = neighborhood
-    ? `${industry} em ${neighborhood} ${city}`
-    : `melhores ${industry} ${city}`;
+  let query1: string;
+  let query2: string;
+  let query3: string;
 
-  console.log(`[Maps Scraper] Iniciando 3 buscas paralelas para: ${industry} / ${city}`);
+  if (neighborhood) {
+    // Todas as 3 queries focadas no bairro específico
+    query1 = `${industry} ${neighborhood} ${city}`;
+    query2 = `${industry} em ${neighborhood} ${city}`;
+    query3 = `melhores ${industry} ${neighborhood} ${city}`;
+  } else {
+    // Sem bairro: variações focadas na cidade
+    query1 = `${industry} ${city}`;
+    query2 = `melhores ${industry} ${city}`;
+    query3 = `${industry} em ${city}`;
+  }
+
+  console.log(`[Maps Scraper] Iniciando 3 buscas paralelas para: ${industry} / ${neighborhood ? neighborhood + ' - ' : ''}${city}`);
+
 
   // Executa as 3 buscas em paralelo
   const [results1, results2, results3] = await Promise.all([
