@@ -197,6 +197,18 @@ async function getGoogleAuthToken() {
   }
 }
 
+// Converte um valor JS para o formato de campo do Firestore REST API
+function toFirestoreField(value: any): any {
+  if (value === null || value === undefined) return { nullValue: null };
+  if (typeof value === 'string') return { stringValue: value };
+  if (typeof value === 'number') {
+    if (Number.isInteger(value)) return { integerValue: value.toString() };
+    return { doubleValue: value };
+  }
+  if (typeof value === 'boolean') return { booleanValue: value };
+  return { stringValue: String(value) };
+}
+
 export async function saveCompanies(companies: Company[]): Promise<{ success: boolean; count: number }> {
   if (!companies.length) throw new Error('Nenhuma empresa para salvar.');
 
@@ -204,29 +216,70 @@ export async function saveCompanies(companies: Company[]): Promise<{ success: bo
   const token = await getGoogleAuthToken();
   
   if (!token) {
+    console.warn('[Maps Scraper] Sem token de autenticação. Salvamento ignorado.');
     return { success: true, count: companies.length };
   }
 
+  const niche = companies[0].niche;
+  const baseUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents`;
+  const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' };
+
   try {
-    const searchId = `search_${Date.now()}`;
-    await fetch(
-      `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/searches?documentId=${searchId}`,
+    // 1. Cria/atualiza o documento do nicho com metadados
+    const nicheDocName = `projects/${projectId}/databases/(default)/documents/niche/${encodeURIComponent(niche)}`;
+    await fetch(`${baseUrl}/niche/${encodeURIComponent(niche)}`, {
+      method: 'PATCH',
+      headers,
+      body: JSON.stringify({
+        fields: {
+          name: toFirestoreField(niche),
+          lastSearchedAt: { timestampValue: new Date().toISOString() },
+          lastCity: toFirestoreField(companies[0].city),
+          totalLastSearch: toFirestoreField(companies.length),
+        }
+      }),
+    });
+
+    // 2. Salva cada empresa como documento individual via batchWrite
+    const writes = companies.map((company) => ({
+      update: {
+        name: `${nicheDocName}/companies/${company.id}`,
+        fields: {
+          name: toFirestoreField(company.name),
+          address: toFirestoreField(company.address),
+          city: toFirestoreField(company.city),
+          neighborhood: toFirestoreField(company.neighborhood ?? null),
+          phone: toFirestoreField(company.phone ?? null),
+          website: toFirestoreField(company.website ?? null),
+          socialMedia: toFirestoreField(company.socialMedia ?? null),
+          rating: toFirestoreField(company.rating ?? null),
+          reviews: toFirestoreField(company.reviews ?? null),
+          niche: toFirestoreField(company.niche),
+          savedAt: { timestampValue: new Date().toISOString() },
+        },
+      },
+    }));
+
+    const batchResponse = await fetch(
+      `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents:batchWrite`,
       {
         method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          fields: {
-            niche: { stringValue: companies[0].niche },
-            city: { stringValue: companies[0].city },
-            createdAt: { timestampValue: new Date().toISOString() },
-            totalCompanies: { integerValue: companies.length.toString() },
-          }
-        }),
+        headers,
+        body: JSON.stringify({ writes }),
       }
     );
 
+    if (!batchResponse.ok) {
+      const errorBody = await batchResponse.text();
+      console.error('[Maps Scraper] Erro no batchWrite:', errorBody);
+      throw new Error('Erro ao salvar empresas no Firestore.');
+    }
+
+    console.log(`[Maps Scraper] ${companies.length} empresas salvas em niche/${niche}/companies`);
     return { success: true, count: companies.length };
-  } catch (error) {
+  } catch (error: any) {
+    console.error('[Maps Scraper] Erro ao salvar:', error?.message);
     throw new Error('Erro ao salvar no banco de dados.');
   }
 }
+
