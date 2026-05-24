@@ -61,18 +61,59 @@ async function getPlaceDetails(place_id: string, niche: string, city: string, ne
   }
 }
 
-// Executa uma única busca de texto e retorna os resultados brutos
-async function runTextSearch(query: string, apiKey: string): Promise<any[]> {
-  try {
-    console.log(`[Maps Scraper] Buscando: "${query}"`);
-    const response = await mapsClient.textSearch({ params: { query, key: apiKey } });
-    const results = response.data.results || [];
-    console.log(`[Maps Scraper] "${query}": ${results.length} resultados`);
-    return results;
-  } catch (err: any) {
-    console.error(`[Maps Scraper] Falha na query "${query}":`, err?.message);
-    return [];
+// Busca uma página usando next_page_token com tentativas automáticas (retry)
+// IMPORTANTE: O Google exige que ao usar pagetoken, também enviemos o parâmetro 'query' original para validação,
+// além da chave de API ('key').
+async function fetchPageDirect(
+  query: string,
+  pagetoken: string,
+  apiKey: string,
+  pageNumber: number,
+  maxRetries = 4,
+  initialDelayMs = 2000
+): Promise<{ results: any[]; nextPageToken?: string } | null> {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    // Delay acumulativo: o Google leva 1.5s-2.0s para ativar o token
+    const waitMs = initialDelayMs * attempt;
+    console.log(`[Maps Scraper] Página ${pageNumber} - tentativa ${attempt}/${maxRetries}: aguardando ${waitMs}ms...`);
+    await new Promise(resolve => setTimeout(resolve, waitMs));
+
+    try {
+      // Requisição direta com query, pagetoken e key
+      const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(query)}&pagetoken=${encodeURIComponent(pagetoken)}&key=${apiKey}`;
+      const response = await fetch(url);
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const data = await response.json();
+      const status: string = data.status;
+      console.log(`[Maps Scraper] Página ${pageNumber} - tentativa ${attempt}: status=${status}, resultados=${data.results?.length ?? 0}`);
+
+      // INVALID_REQUEST = token ainda não propagado, tenta novamente
+      if (status === 'INVALID_REQUEST' && attempt < maxRetries) {
+        continue;
+      }
+
+      if (status === 'OK' || status === 'ZERO_RESULTS') {
+        return {
+          results: data.results || [],
+          nextPageToken: data.next_page_token,
+        };
+      }
+
+      // Última tentativa, retorna o que tiver
+      if (attempt === maxRetries) {
+        console.warn(`[Maps Scraper] Página ${pageNumber}: status final = ${status}`);
+        return { results: data.results || [] };
+      }
+    } catch (err: any) {
+      console.error(`[Maps Scraper] Erro na tentativa ${attempt}/${maxRetries}:`, err?.message);
+      if (attempt === maxRetries) return null;
+    }
   }
+  return null;
 }
 
 export async function searchCompanies(data: z.infer<typeof searchSchema>): Promise<Company[]> {
@@ -81,51 +122,63 @@ export async function searchCompanies(data: z.infer<typeof searchSchema>): Promi
     throw new Error('Configuração incompleta: API Key ausente.');
   }
 
-  // Monta 3 variações da query, SEMPRE mantendo o foco geográfico informado.
-  // Quando bairro é informado, TODAS as queries incluem o bairro para não vazar para outras regiões.
   const { industry, city, neighborhood } = data;
 
-  let query1: string;
-  let query2: string;
-  let query3: string;
+  // Monta a query limpando espaços extras (ex: quando bairro não é informado)
+  const queryParts = [industry, neighborhood, city].filter(Boolean);
+  const query = queryParts.join(' ');
 
-  if (neighborhood) {
-    // Todas as 3 queries focadas no bairro específico
-    query1 = `${industry} ${neighborhood} ${city}`;
-    query2 = `${industry} em ${neighborhood} ${city}`;
-    query3 = `melhores ${industry} ${neighborhood} ${city}`;
-  } else {
-    // Sem bairro: variações focadas na cidade
-    query1 = `${industry} ${city}`;
-    query2 = `melhores ${industry} ${city}`;
-    query3 = `${industry} em ${city}`;
-  }
-
-  console.log(`[Maps Scraper] Iniciando 3 buscas paralelas para: ${industry} / ${neighborhood ? neighborhood + ' - ' : ''}${city}`);
-
-
-  // Executa as 3 buscas em paralelo
-  const [results1, results2, results3] = await Promise.all([
-    runTextSearch(query1, apiKey),
-    runTextSearch(query2, apiKey),
-    runTextSearch(query3, apiKey),
-  ]);
-
-  // Deduplica todos os resultados por place_id
-  const seen = new Set<string>();
-  const uniqueResults: any[] = [];
-  for (const r of [...results1, ...results2, ...results3]) {
-    if (r.place_id && !seen.has(r.place_id)) {
-      seen.add(r.place_id);
-      uniqueResults.push(r);
-    }
-  }
-
-  console.log(`[Maps Scraper] Total único após deduplicação: ${uniqueResults.length} (de ${results1.length + results2.length + results3.length} brutos)`);
-
-  if (uniqueResults.length === 0) return [];
-
+  let allResults: any[] = [];
+  
   try {
+    console.log(`[Maps Scraper] Iniciando busca: "${query}"`);
+    const response = await mapsClient.textSearch({
+      params: { query, key: apiKey },
+    });
+    
+    if (response.data.results) {
+      allResults = [...response.data.results];
+    }
+
+    console.log(`[Maps Scraper] Página 1: ${allResults.length} resultados. Token: ${response.data.next_page_token ? 'sim' : 'não'}`);
+
+    let nextPageToken = response.data.next_page_token;
+    // pageNumber representa a PRÓXIMA página a ser buscada (2 e 3)
+    let pageNumber = 2;
+
+    // Busca as pages 2 e 3 (Google limita a 60 resultados = 3 páginas de 20)
+    while (nextPageToken && pageNumber <= 3) {
+      const pageData = await fetchPageDirect(query, nextPageToken, apiKey, pageNumber);
+
+      if (!pageData) {
+        console.warn(`[Maps Scraper] Página ${pageNumber} falhou após todas as tentativas.`);
+        break;
+      }
+      
+      allResults = [...allResults, ...pageData.results];
+      nextPageToken = pageData.nextPageToken;
+      console.log(`[Maps Scraper] Página ${pageNumber} coletada: +${pageData.results.length} resultados. Total acumulado: ${allResults.length}`);
+      pageNumber++;
+    }
+
+    if (pageNumber === 2 && !nextPageToken) {
+      console.warn('[Maps Scraper] ATENÇÃO: next_page_token não foi retornado pelo Google na página 1. Apenas 20 resultados disponíveis.');
+    }
+
+    // Deduplica todos os resultados por place_id
+    const seen = new Set<string>();
+    const uniqueResults: any[] = [];
+    for (const r of allResults) {
+      if (r.place_id && !seen.has(r.place_id)) {
+        seen.add(r.place_id);
+        uniqueResults.push(r);
+      }
+    }
+
+    console.log(`[Maps Scraper] Total único após deduplicação: ${uniqueResults.length}`);
+
+    if (uniqueResults.length === 0) return [];
+
     const companies: Company[] = [];
     const batchSize = 15; // Processar em lotes para evitar timeout
 
@@ -161,11 +214,36 @@ export async function handleEnrichData({ companyName }: { companyName: string })
 async function getGoogleAuthToken() {
   try {
     const { GoogleAuth } = await import('google-auth-library');
-    const auth = new GoogleAuth({ scopes: 'https://www.googleapis.com/auth/cloud-platform' });
+    
+    const projectId = process.env.FIREBASE_PROJECT_ID || process.env.PROJECT_ID;
+    const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+    const privateKey = process.env.FIREBASE_PRIVATE_KEY;
+
+    let auth;
+    if (clientEmail && privateKey) {
+      console.log('[Maps Scraper] Autenticando localmente usando credenciais do Service Account do .env.local');
+      // Remove aspas extras e converte quebras de linha (\n) se necessário
+      const formattedPrivateKey = privateKey.replace(/\\n/g, '\n').replace(/"/g, '').trim();
+      auth = new GoogleAuth({
+        scopes: 'https://www.googleapis.com/auth/cloud-platform',
+        projectId,
+        credentials: {
+          client_email: clientEmail,
+          private_key: formattedPrivateKey,
+        }
+      });
+    } else {
+      console.log('[Maps Scraper] Autenticando usando credenciais padrão (ADC/Cloud Run)');
+      auth = new GoogleAuth({
+        scopes: 'https://www.googleapis.com/auth/cloud-platform'
+      });
+    }
+
     const client = await auth.getClient();
     const token = await client.getAccessToken();
     return token.token;
-  } catch (e) {
+  } catch (e: any) {
+    console.error('[Maps Scraper] Erro ao obter token do Google Auth:', e?.message);
     return null;
   }
 }
@@ -185,7 +263,7 @@ function toFirestoreField(value: any): any {
 export async function saveCompanies(companies: Company[]): Promise<{ success: boolean; count: number }> {
   if (!companies.length) throw new Error('Nenhuma empresa para salvar.');
 
-  const projectId = process.env.PROJECT_ID || 'scraper-maps-9268a';
+  const projectId = process.env.FIREBASE_PROJECT_ID || process.env.PROJECT_ID || 'scraper-maps-9268a';
   const token = await getGoogleAuthToken();
   
   if (!token) {
